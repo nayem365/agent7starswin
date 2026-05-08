@@ -2,6 +2,7 @@ import asyncio
 import logging
 import os
 import re
+import signal
 from datetime import datetime, timezone
 
 import aiohttp
@@ -1118,17 +1119,69 @@ async def main():
     dp = Dispatcher(storage=MemoryStorage())
     dp.include_router(router)
 
-    logger.info("Deleting webhook and clearing pending updates…")
-    await bot.delete_webhook(drop_pending_updates=True)
-    await asyncio.sleep(1)
+    # ── Graceful shutdown on SIGTERM (Heroku sends this on dyno restart) ──────
+    loop = asyncio.get_running_loop()
+    stop_event = asyncio.Event()
 
-    logger.info("Starting polling…")
-    while True:
+    def _handle_sigterm():
+        logger.info("SIGTERM received — initiating graceful shutdown…")
+        stop_event.set()
+
+    loop.add_signal_handler(signal.SIGTERM, _handle_sigterm)
+    loop.add_signal_handler(signal.SIGINT,  _handle_sigterm)
+
+    # ── Clear any stale webhook / pending updates ─────────────────────────────
+    # Wait up to 10 s for any previous instance to release the getUpdates lock.
+    logger.info("Deleting webhook and clearing pending updates…")
+    for attempt in range(5):
         try:
-            await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
+            await bot.delete_webhook(drop_pending_updates=True)
+            break
         except Exception as e:
-            logger.error(f"Polling crashed: {e}. Restarting in 5 s…")
-            await asyncio.sleep(5)
+            logger.warning(f"delete_webhook attempt {attempt + 1} failed: {e}. Retrying…")
+            await asyncio.sleep(2)
+
+    # Extra grace period so the old instance fully releases the poll slot.
+    await asyncio.sleep(3)
+
+    # ── Start polling in a background task ───────────────────────────────────
+    logger.info("Starting polling…")
+
+    async def _poll():
+        while not stop_event.is_set():
+            try:
+                await dp.start_polling(
+                    bot,
+                    allowed_updates=dp.resolve_used_update_types(),
+                    handle_signals=False,   # we handle signals ourselves
+                )
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                if stop_event.is_set():
+                    break
+                logger.error(f"Polling crashed: {e}. Restarting in 5 s…")
+                await asyncio.sleep(5)
+
+    poll_task = asyncio.create_task(_poll())
+
+    # Block until stop signal
+    await stop_event.wait()
+
+    # ── Clean teardown (must finish within Heroku's 30 s window) ─────────────
+    logger.info("Stopping polling…")
+    await dp.stop_polling()
+    poll_task.cancel()
+    try:
+        await asyncio.wait_for(poll_task, timeout=10)
+    except (asyncio.CancelledError, asyncio.TimeoutError):
+        pass
+
+    await bot.session.close()
+    if db_client:
+        db_client.close()
+
+    logger.info("Shutdown complete.")
 
 
 if __name__ == "__main__":
